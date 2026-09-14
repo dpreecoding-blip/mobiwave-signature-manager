@@ -21,11 +21,11 @@ const sql = connectionString ? postgres(connectionString, { max: Number(process.
 const db = sql ? drizzle(sql, { schema }) : null;
 const gatewayKey = process.env.SIGNATURE_GATEWAY_API_KEY || '';
 
-function requireDb(res: express.Response) {
+function requireDb(res: any) {
   if (!db) { res.status(503).json({ error: 'DATABASE_URL is not configured' }); return null; }
   return db;
 }
-function gatewayAuth(req: express.Request, res: express.Response) {
+function gatewayAuth(req: any, res: any) {
   if (!gatewayKey || req.header('x-signature-gateway-key') !== gatewayKey) { res.status(401).json({ error: 'Unauthorized' }); return false; }
   return true;
 }
