@@ -1,14 +1,14 @@
 {
   "name":"mobiwave-signature-manager",
   "private":true,
-  "workspaces":["frontend","backend"],
+  "packageManager":"pnpm@10.15.1",
   "scripts":{
-    "dev":"concurrently \"npm --workspace frontend run dev\" \"npm --workspace backend run dev\"",
-    "build":"npm --workspace frontend run build && npm --workspace backend run build",
-    "db:generate":"npm --workspace backend run db:generate",
-    "db:migrate":"npm --workspace backend run db:migrate",
-    "db:push":"npm --workspace backend run db:push",
-    "db:seed":"npm --workspace backend run db:seed"
+    "dev":"concurrently \"pnpm --filter frontend dev\" \"pnpm --filter backend dev\"",
+    "build":"pnpm --filter frontend build && pnpm --filter backend build",
+    "db:generate":"pnpm --filter backend db:generate",
+    "db:migrate":"pnpm --filter backend db:migrate",
+    "db:push":"pnpm --filter backend db:push",
+    "db:seed":"pnpm --filter backend db:seed"
   },
   "devDependencies":{"concurrently":"^9.2.1"}
 }
