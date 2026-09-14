@@ -110,7 +110,23 @@ app.post('/api/signatures/resolve', async (req, res) => {
     const org = (await d.select().from(schema.organizations).where(eq(schema.organizations.id, organizationId)).limit(1))[0];
     const branding = (await d.select().from(schema.brandingSettings).where(eq(schema.brandingSettings.organizationId, organizationId)).limit(1))[0];
     const dept = emp?.departmentId ? (await d.select().from(schema.departments).where(eq(schema.departments.id, emp.departmentId)).limit(1))[0] : undefined;
-    const data: Record<string,string|undefined> = { first_name: emp?.firstName ?? undefined, last_name: emp?.lastName ?? undefined, display_name: emp ? `${emp.firstName} ${emp.lastName}` : sender, job_title: emp?.jobTitle ?? undefined, department: dept?.name ?? undefined, email: sender, phone: emp?.phone ?? undefined, mobile: emp?.mobile ?? undefined, company_name: branding?.companyName || org?.name || 'MobiWave Innovations Ltd', website: branding?.website || 'https://mobiwave.co.ke', company_address: branding?.address ?? undefined, logo_url: branding?.logoUrl ?? undefined, disclaimer: branding?.disclaimer ?? undefined, ...Object.fromEntries(Object.entries((branding?.socialLinks || {}) as Record<string,string|null>).map(([key, value]) => [key, value ?? undefined])) };
+    const socialLinks = (branding?.socialLinks || {}) as Record<string, string | null>;
+    const data: Record<string,string|undefined> = {
+      first_name: emp?.firstName ?? undefined,
+      last_name: emp?.lastName ?? undefined,
+      display_name: emp ? `${emp.firstName} ${emp.lastName}` : sender,
+      job_title: emp?.jobTitle ?? undefined,
+      department: dept?.name ?? undefined,
+      email: sender,
+      phone: emp?.phone ?? undefined,
+      mobile: emp?.mobile ?? undefined,
+      company_name: branding?.companyName ?? org?.name ?? 'MobiWave Innovations Ltd',
+      website: branding?.website ?? 'https://mobiwave.co.ke',
+      company_address: branding?.address ?? undefined,
+      logo_url: branding?.logoUrl ?? undefined,
+      disclaimer: branding?.disclaimer ?? undefined,
+      ...Object.fromEntries(Object.entries(socialLinks).map(([key, value]) => [key, value ?? undefined]))
+    };
     const html = renderSignature(ver.html, data);
     res.json({ inject: true, signatureId: sig.id, version: sig.currentVersion, html: `${signatureMarkers.start}${html}${signatureMarkers.end}`, plainText: ver.plainText || '' });
   } catch (e) { console.error(e); res.status(500).json({ error: 'resolution failed' }); }
