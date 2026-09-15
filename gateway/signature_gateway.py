@@ -20,7 +20,8 @@ from io import BytesIO
 
 import Milter
 
-API_URL = os.environ.get("SIGNATURE_MANAGER_URL", "https://mobiwave-signature-manager.vercel.app")
+API_URL = os.environ.get("SIGNATURE_MANAGER_URL", "").strip()
+MAX_MESSAGE_BYTES = int(os.environ.get("SIGNATURE_MAX_MESSAGE_BYTES", str(10 * 1024 * 1024)))
 API_KEY = os.environ.get("SIGNATURE_GATEWAY_API_KEY", "")
 ORGANIZATION_ID = os.environ.get("SIGNATURE_ORGANIZATION_ID", "")
 SOCKET = os.environ.get("MILTER_SOCKET", "inet:10025@127.0.0.1")
@@ -63,8 +64,8 @@ def extract_html(msg: EmailMessage) -> bytes:
 
 
 def call_resolver(sender: str, kind: str, body_html: str) -> dict | None:
-    if not API_KEY or not ORGANIZATION_ID:
-        log.warning("gateway credentials are not configured; leaving message unchanged")
+    if not API_URL or not API_KEY or not ORGANIZATION_ID:
+        log.warning("gateway URL or credentials are not configured; leaving message unchanged")
         return None
     payload = json.dumps({
         "organizationId": ORGANIZATION_ID,
@@ -222,6 +223,9 @@ class SignatureMilter(Milter.Base):
 
     def eom(self):
         body = b"".join(self.chunks)
+        if len(body) > MAX_MESSAGE_BYTES:
+            log.warning("message exceeds configured size limit; leaving unchanged")
+            return Milter.CONTINUE
         if not self.mail_from or not body:
             return Milter.CONTINUE
         try:

@@ -11,9 +11,26 @@ import { renderSignature, hasSignature, signatureMarkers } from './signature.js'
 import * as schema from './db/schema.js';
 const app = express();
 app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '1mb' }));
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+const allowedOrigins = new Set((process.env.FRONTEND_URL || '').split(',').map((origin) => origin.trim()).filter(Boolean));
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || allowedOrigins.has(origin))
+            return callback(null, true);
+        return callback(new Error('Origin not allowed'));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['content-type', 'x-signature-gateway-key', 'x-signature-manager-key'],
+}));
+app.use(express.json({ limit: '256kb', strict: true }));
+app.use((error, _req, res, next) => {
+    if (error?.type === 'entity.too.large')
+        return res.status(413).json({ error: 'Payload too large' });
+    if (error?.message === 'Origin not allowed')
+        return res.status(403).json({ error: 'Origin not allowed' });
+    return next(error);
+});
 let db = null;
 let sql = null;
 function getDb() {
@@ -61,17 +78,42 @@ app.get('/api/health', async (_req, res) => {
     }
 });
 const resourceMap = { organizations: schema.organizations, departments: schema.departments, employees: schema.employees, domains: schema.domains, emailAccounts: schema.emailAccounts, signatureTemplates: schema.signatureTemplates, signatures: schema.signatures, signatureVersions: schema.signatureVersions, branding: schema.brandingSettings, policies: schema.policies, gatewayKeys: schema.gatewayKeys, audit: schema.auditLogs };
+const adminResources = new Set(['organizations', 'departments', 'employees', 'domains', 'emailAccounts', 'signatureTemplates', 'signatures', 'signatureVersions', 'branding', 'policies']);
+const uuidSchema = z.string().uuid();
+function managerAuth(req, res) {
+    const expected = process.env.SIGNATURE_MANAGER_API_KEY || '';
+    const supplied = req.header('x-signature-manager-key') || '';
+    if (!expected) {
+        res.status(503).json({ error: 'Manager API authentication is not configured' });
+        return false;
+    }
+    if (!supplied || supplied.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return false;
+    }
+    return true;
+}
+function resourceName(req) { return String(req.params.resource || ''); }
+function validLimit(value) { const parsed = Number(value ?? 100); return Number.isInteger(parsed) && parsed > 0 && parsed <= 500 ? parsed : null; }
 app.get('/api/:resource', async (req, res) => {
-    const table = resourceMap[req.params.resource];
-    if (!table)
+    const resource = resourceName(req);
+    const table = resourceMap[resource];
+    if (!table || !adminResources.has(resource))
         return res.status(404).json({ error: 'Unknown resource' });
+    if (!managerAuth(req, res))
+        return;
+    const limit = validLimit(req.query.limit);
+    if (!limit)
+        return res.status(400).json({ error: 'Invalid limit' });
+    const organizationId = String(req.query.organizationId || '');
+    if (!uuidSchema.safeParse(organizationId).success)
+        return res.status(400).json({ error: 'organizationId must be a UUID' });
     const d = requireDb(res);
     if (!d)
         return;
     try {
-        const organizationId = String(req.query.organizationId || '');
-        const where = organizationId && table.organizationId ? eq(table.organizationId, organizationId) : undefined;
-        const rows = await d.select().from(table).where(where).limit(Math.min(Number(req.query.limit || 100), 500));
+        const where = eq(table.organizationId, organizationId);
+        const rows = await d.select().from(table).where(where).limit(limit);
         res.json({ data: rows });
     }
     catch (error) {
@@ -80,14 +122,20 @@ app.get('/api/:resource', async (req, res) => {
     }
 });
 app.get('/api/:resource/:id', async (req, res) => {
-    const table = resourceMap[req.params.resource];
-    if (!table)
+    const resource = resourceName(req);
+    const table = resourceMap[resource];
+    if (!table || !adminResources.has(resource))
         return res.status(404).json({ error: 'Unknown resource' });
+    if (!managerAuth(req, res))
+        return;
+    const organizationId = String(req.query.organizationId || '');
+    if (!uuidSchema.safeParse(organizationId).success)
+        return res.status(400).json({ error: 'organizationId must be a UUID' });
     const d = requireDb(res);
     if (!d)
         return;
     try {
-        const row = (await d.select().from(table).where(eq(table.id, req.params.id)).limit(1))[0];
+        const row = (await d.select().from(table).where(and(eq(table.id, req.params.id), eq(table.organizationId, organizationId))).limit(1))[0];
         row ? res.json({ data: row }) : res.status(404).json({ error: 'Not found' });
     }
     catch {
@@ -192,9 +240,15 @@ catch {
 app.post('/api/gateway/verify', async (req, res) => { if (!gatewayAuth(req, res))
     return; res.json({ ok: true, service: 'signature-gateway', time: new Date().toISOString() }); });
 app.post('/api/:resource', async (req, res) => {
-    const table = resourceMap[req.params.resource];
-    if (!table || req.params.resource === 'audit' || req.params.resource === 'gatewayKeys')
+    const resource = resourceName(req);
+    const table = resourceMap[resource];
+    if (!table || !adminResources.has(resource))
         return res.status(404).json({ error: 'Unknown or protected resource' });
+    if (!managerAuth(req, res))
+        return;
+    const organizationId = String(req.body?.organizationId || '');
+    if (!uuidSchema.safeParse(organizationId).success)
+        return res.status(400).json({ error: 'organizationId must be a UUID' });
     const d = requireDb(res);
     if (!d)
         return;
@@ -210,14 +264,20 @@ app.post('/api/:resource', async (req, res) => {
     }
 });
 app.patch('/api/:resource/:id', async (req, res) => {
-    const table = resourceMap[req.params.resource];
-    if (!table || req.params.resource === 'audit' || req.params.resource === 'gatewayKeys')
+    const resource = resourceName(req);
+    const table = resourceMap[resource];
+    if (!table || !adminResources.has(resource))
         return res.status(404).json({ error: 'Unknown or protected resource' });
+    if (!managerAuth(req, res))
+        return;
+    const organizationId = String(req.body?.organizationId || req.query.organizationId || '');
+    if (!uuidSchema.safeParse(organizationId).success)
+        return res.status(400).json({ error: 'organizationId must be a UUID' });
     const d = requireDb(res);
     if (!d)
         return;
     try {
-        const [row] = await d.update(table).set(cleanRecord(req.body)).where(eq(table.id, req.params.id)).returning();
+        const [row] = await d.update(table).set(cleanRecord(req.body)).where(and(eq(table.id, req.params.id), eq(table.organizationId, organizationId))).returning();
         if (!row)
             return res.status(404).json({ error: 'Not found' });
         if (row.organizationId)
@@ -229,14 +289,20 @@ app.patch('/api/:resource/:id', async (req, res) => {
     }
 });
 app.delete('/api/:resource/:id', async (req, res) => {
-    const table = resourceMap[req.params.resource];
-    if (!table || req.params.resource === 'audit' || req.params.resource === 'gatewayKeys')
+    const resource = resourceName(req);
+    const table = resourceMap[resource];
+    if (!table || !adminResources.has(resource))
         return res.status(404).json({ error: 'Unknown or protected resource' });
+    if (!managerAuth(req, res))
+        return;
+    const organizationId = String(req.body?.organizationId || req.query.organizationId || '');
+    if (!uuidSchema.safeParse(organizationId).success)
+        return res.status(400).json({ error: 'organizationId must be a UUID' });
     const d = requireDb(res);
     if (!d)
         return;
     try {
-        await d.delete(table).where(eq(table.id, req.params.id));
+        await d.delete(table).where(and(eq(table.id, req.params.id), eq(table.organizationId, organizationId)));
         res.status(204).end();
     }
     catch {
