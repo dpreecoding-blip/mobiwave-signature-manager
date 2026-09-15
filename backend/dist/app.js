@@ -4,8 +4,9 @@ import cors from 'cors';
 import helmet from 'helmet';
 import postgres from 'postgres';
 import { drizzle } from 'drizzle-orm/postgres-js';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, desc } from 'drizzle-orm';
 import { z } from 'zod';
+import crypto from 'node:crypto';
 import { renderSignature, hasSignature, signatureMarkers } from './signature.js';
 import * as schema from './db/schema.js';
 const app = express();
@@ -13,56 +14,53 @@ app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
-const connectionString = process.env.DATABASE_URL;
-const sql = connectionString ? postgres(connectionString, { max: Number(process.env.DB_POOL_MAX || 5), prepare: false }) : null;
-const db = sql ? drizzle(sql, { schema }) : null;
-const gatewayKey = process.env.SIGNATURE_GATEWAY_API_KEY || '';
-function requireDb(res) {
-    if (!db) {
-        res.status(503).json({ error: 'DATABASE_URL is not configured' });
+let db = null;
+let sql = null;
+function getDb() {
+    if (db)
+        return db;
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString)
         return null;
-    }
+    sql = postgres(connectionString, { max: Number(process.env.DB_POOL_MAX || 5), prepare: false, idle_timeout: 20, connect_timeout: 10 });
+    db = drizzle(sql, { schema });
     return db;
 }
+function gatewaySecretConfigured() { return Boolean(process.env.SIGNATURE_GATEWAY_API_KEY); }
+function requireDb(res) { const d = getDb(); if (!d) {
+    res.status(503).json({ error: 'DATABASE_URL is not configured' });
+    return null;
+} return d; }
 function gatewayAuth(req, res) {
-    if (!gatewayKey || req.header('x-signature-gateway-key') !== gatewayKey) {
+    const expected = process.env.SIGNATURE_GATEWAY_API_KEY || '';
+    const supplied = req.header('x-signature-gateway-key') || '';
+    if (!expected || !supplied || supplied.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) {
         res.status(401).json({ error: 'Unauthorized' });
         return false;
     }
     return true;
 }
-function cleanRecord(value) {
-    const out = {};
-    for (const [k, v] of Object.entries(value))
-        if (v !== undefined)
-            out[k] = v;
-    return out;
+function cleanRecord(value) { const out = {}; for (const [k, v] of Object.entries(value))
+    if (v !== undefined)
+        out[k] = v; return out; }
+async function recordAudit(d, organizationId, action, entityType, entityId, metadata) {
+    await d.insert(schema.auditLogs).values({ organizationId, action, entityType, entityId, metadata: metadata });
 }
 app.get('/api/health', async (_req, res) => {
-    if (!db)
-        return res.json({ ok: true, service: 'mobiwave-signature-manager', database: 'not-configured', time: new Date().toISOString() });
+    const d = getDb();
+    const base = { ok: true, service: 'mobiwave-signature-manager', databaseConfigured: Boolean(process.env.DATABASE_URL), gatewayKeyConfigured: gatewaySecretConfigured(), time: new Date().toISOString() };
+    if (!d)
+        return res.json({ ...base, database: 'not_configured' });
     try {
-        await db.execute('select 1');
-        res.json({ ok: true, service: 'mobiwave-signature-manager', database: 'connected', time: new Date().toISOString() });
+        await d.execute('select 1');
+        return res.json({ ...base, database: 'connected' });
     }
-    catch {
-        res.status(503).json({ ok: false, service: 'mobiwave-signature-manager', database: 'error', time: new Date().toISOString() });
+    catch (error) {
+        console.error('database health check failed', error);
+        return res.status(503).json({ ...base, ok: false, database: 'error' });
     }
 });
-const resourceMap = {
-    organizations: schema.organizations,
-    departments: schema.departments,
-    employees: schema.employees,
-    domains: schema.domains,
-    emailAccounts: schema.emailAccounts,
-    signatureTemplates: schema.signatureTemplates,
-    signatures: schema.signatures,
-    signatureVersions: schema.signatureVersions,
-    branding: schema.brandingSettings,
-    policies: schema.policies,
-    gatewayKeys: schema.gatewayKeys,
-    audit: schema.auditLogs,
-};
+const resourceMap = { organizations: schema.organizations, departments: schema.departments, employees: schema.employees, domains: schema.domains, emailAccounts: schema.emailAccounts, signatureTemplates: schema.signatureTemplates, signatures: schema.signatures, signatureVersions: schema.signatureVersions, branding: schema.brandingSettings, policies: schema.policies, gatewayKeys: schema.gatewayKeys, audit: schema.auditLogs };
 app.get('/api/:resource', async (req, res) => {
     const table = resourceMap[req.params.resource];
     if (!table)
@@ -76,7 +74,8 @@ app.get('/api/:resource', async (req, res) => {
         const rows = await d.select().from(table).where(where).limit(Math.min(Number(req.query.limit || 100), 500));
         res.json({ data: rows });
     }
-    catch {
+    catch (error) {
+        console.error('list failed', error);
         res.status(500).json({ error: 'database error' });
     }
 });
@@ -126,58 +125,70 @@ app.post('/api/signatures/resolve', async (req, res) => {
             return res.json({ inject: false, reason: 'policy_reply_disabled' });
         if (messageType === 'forward' && policy && !policy.injectForwards)
             return res.json({ inject: false, reason: 'policy_forward_disabled' });
+        const employee = account.employeeId ? (await d.select().from(schema.employees).where(and(eq(schema.employees.id, account.employeeId), eq(schema.employees.organizationId, organizationId), eq(schema.employees.active, true))).limit(1))[0] : undefined;
+        const department = employee?.departmentId ? (await d.select().from(schema.departments).where(and(eq(schema.departments.id, employee.departmentId), eq(schema.departments.organizationId, organizationId))).limit(1))[0] : undefined;
+        const domain = account.domainId ? (await d.select().from(schema.domains).where(and(eq(schema.domains.id, account.domainId), eq(schema.domains.organizationId, organizationId), eq(schema.domains.active, true))).limit(1))[0] : undefined;
+        const senderDomain = sender.split('@')[1]?.toLowerCase();
+        const domainByEmail = !domain && senderDomain ? (await d.select().from(schema.domains).where(and(eq(schema.domains.organizationId, organizationId), eq(schema.domains.domain, senderDomain), eq(schema.domains.active, true))).limit(1))[0] : domain;
         let sig = null;
-        if (account.signatureId)
-            sig = (await d.select().from(schema.signatures).where(and(eq(schema.signatures.id, account.signatureId), eq(schema.signatures.organizationId, organizationId))).limit(1))[0];
-        if (!sig && account.employeeId)
-            sig = (await d.select().from(schema.signatures).where(and(eq(schema.signatures.employeeId, account.employeeId), eq(schema.signatures.organizationId, organizationId), eq(schema.signatures.published, true))).limit(1))[0];
+        let source = 'none';
+        if (account.signatureId) {
+            sig = (await d.select().from(schema.signatures).where(and(eq(schema.signatures.id, account.signatureId), eq(schema.signatures.organizationId, organizationId), eq(schema.signatures.published, true))).limit(1))[0];
+            if (sig)
+                source = 'account';
+        }
+        if (!sig && employee) {
+            sig = (await d.select().from(schema.signatures).where(and(eq(schema.signatures.employeeId, employee.id), eq(schema.signatures.organizationId, organizationId), eq(schema.signatures.published, true))).orderBy(desc(schema.signatures.createdAt)).limit(1))[0];
+            if (sig)
+                source = 'employee';
+        }
+        if (!sig && department?.defaultSignatureId) {
+            sig = (await d.select().from(schema.signatures).where(and(eq(schema.signatures.id, department.defaultSignatureId), eq(schema.signatures.organizationId, organizationId), eq(schema.signatures.published, true))).limit(1))[0];
+            if (sig)
+                source = 'department';
+        }
+        if (!sig && domainByEmail?.defaultSignatureId) {
+            sig = (await d.select().from(schema.signatures).where(and(eq(schema.signatures.id, domainByEmail.defaultSignatureId), eq(schema.signatures.organizationId, organizationId), eq(schema.signatures.published, true))).limit(1))[0];
+            if (sig)
+                source = 'domain';
+        }
+        if (!sig) {
+            sig = (await d.select().from(schema.signatures).where(and(eq(schema.signatures.organizationId, organizationId), eq(schema.signatures.published, true))).orderBy(desc(schema.signatures.createdAt)).limit(1))[0];
+            if (sig)
+                source = 'global';
+        }
         if (!sig)
             return res.json({ inject: false, reason: 'no_signature' });
         const ver = (await d.select().from(schema.signatureVersions).where(and(eq(schema.signatureVersions.signatureId, sig.id), eq(schema.signatureVersions.version, sig.currentVersion))).limit(1))[0];
         if (!ver)
             return res.json({ inject: false, reason: 'version_missing' });
-        const emp = account.employeeId ? (await d.select().from(schema.employees).where(eq(schema.employees.id, account.employeeId)).limit(1))[0] : undefined;
         const org = (await d.select().from(schema.organizations).where(eq(schema.organizations.id, organizationId)).limit(1))[0];
         const branding = (await d.select().from(schema.brandingSettings).where(eq(schema.brandingSettings.organizationId, organizationId)).limit(1))[0];
-        const dept = emp?.departmentId ? (await d.select().from(schema.departments).where(eq(schema.departments.id, emp.departmentId)).limit(1))[0] : undefined;
         const socialLinks = (branding?.socialLinks || {});
         const data = {
-            first_name: emp?.firstName ?? undefined,
-            last_name: emp?.lastName ?? undefined,
-            display_name: emp ? `${emp.firstName} ${emp.lastName}` : sender,
-            job_title: emp?.jobTitle ?? undefined,
-            department: dept?.name ?? undefined,
-            email: sender,
-            phone: emp?.phone ?? undefined,
-            mobile: emp?.mobile ?? undefined,
-            company_name: branding?.companyName ?? org?.name ?? 'MobiWave Innovations Ltd',
-            website: branding?.website ?? 'https://mobiwave.co.ke',
-            company_address: branding?.address ?? undefined,
-            logo_url: branding?.logoUrl ?? undefined,
-            disclaimer: branding?.disclaimer ?? undefined,
-            ...Object.fromEntries(Object.entries(socialLinks).map(([key, value]) => [key, value ?? undefined]))
+            first_name: employee?.firstName, last_name: employee?.lastName, display_name: employee ? `${employee.firstName} ${employee.lastName}` : sender,
+            job_title: employee?.jobTitle, department: department?.name, email: sender, phone: employee?.phone, mobile: employee?.mobile,
+            company_name: branding?.companyName ?? org?.name ?? 'MobiWave Innovations Ltd', website: branding?.website ?? 'https://mobiwave.co.ke',
+            company_address: branding?.address, logo_url: branding?.logoUrl, disclaimer: branding?.disclaimer,
+            ...Object.fromEntries(Object.entries(socialLinks).map(([key, value]) => [key, value ?? undefined])),
         };
         const html = renderSignature(ver.html, data);
-        res.json({ inject: true, signatureId: sig.id, version: sig.currentVersion, html: `${signatureMarkers.start}${html}${signatureMarkers.end}`, plainText: ver.plainText || '' });
+        await recordAudit(d, organizationId, 'signature_resolved', 'signature', sig.id, { sender, messageType, source, version: sig.currentVersion });
+        res.json({ inject: true, signatureId: sig.id, version: sig.currentVersion, source, html: `${signatureMarkers.start}${html}${signatureMarkers.end}`, plainText: ver.plainText || '' });
     }
-    catch (e) {
-        console.error(e);
+    catch (error) {
+        console.error('resolution failed', error);
         res.status(500).json({ error: 'resolution failed' });
     }
 });
-app.post('/api/gateway/heartbeat', async (req, res) => {
-    if (!gatewayAuth(req, res))
-        return;
-    const d = requireDb(res);
-    if (!d)
-        return;
-    try {
-        res.json({ ok: true, time: new Date().toISOString() });
-    }
-    catch {
-        res.status(500).json({ error: 'heartbeat failed' });
-    }
-});
+app.post('/api/gateway/heartbeat', async (req, res) => { if (!gatewayAuth(req, res))
+    return; const d = requireDb(res); if (!d)
+    return; try {
+    res.json({ ok: true, time: new Date().toISOString() });
+}
+catch {
+    res.status(500).json({ error: 'heartbeat failed' });
+} });
 app.post('/api/gateway/verify', async (req, res) => { if (!gatewayAuth(req, res))
     return; res.json({ ok: true, service: 'signature-gateway', time: new Date().toISOString() }); });
 app.post('/api/:resource', async (req, res) => {
@@ -189,9 +200,12 @@ app.post('/api/:resource', async (req, res) => {
         return;
     try {
         const [row] = await d.insert(table).values(req.body).returning();
+        if (req.body.organizationId)
+            await recordAudit(d, req.body.organizationId, 'created', req.params.resource, row?.id, { fields: Object.keys(req.body) });
         res.status(201).json({ data: row });
     }
-    catch (e) {
+    catch (error) {
+        console.error('create failed', error);
         res.status(400).json({ error: 'create failed' });
     }
 });
@@ -204,7 +218,11 @@ app.patch('/api/:resource/:id', async (req, res) => {
         return;
     try {
         const [row] = await d.update(table).set(cleanRecord(req.body)).where(eq(table.id, req.params.id)).returning();
-        row ? res.json({ data: row }) : res.status(404).json({ error: 'Not found' });
+        if (!row)
+            return res.status(404).json({ error: 'Not found' });
+        if (row.organizationId)
+            await recordAudit(d, row.organizationId, 'updated', req.params.resource, row.id, { fields: Object.keys(req.body) });
+        res.json({ data: row });
     }
     catch {
         res.status(400).json({ error: 'update failed' });
