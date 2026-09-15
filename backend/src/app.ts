@@ -30,8 +30,8 @@ function getDb(): Database | null {
 }
 
 function gatewaySecretConfigured() { return Boolean(process.env.SIGNATURE_GATEWAY_API_KEY); }
-function requireDb(res: express.Response): Database | null { const d = getDb(); if (!d) { res.status(503).json({ error: 'DATABASE_URL is not configured' }); return null; } return d; }
-function gatewayAuth(req: express.Request, res: express.Response) {
+function requireDb(res: any): Database | null { const d = getDb(); if (!d) { res.status(503).json({ error: 'DATABASE_URL is not configured' }); return null; } return d; }
+function gatewayAuth(req: any, res: any) {
   const expected = process.env.SIGNATURE_GATEWAY_API_KEY || '';
   const supplied = req.header('x-signature-gateway-key') || '';
   if (!expected || !supplied || supplied.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) { res.status(401).json({ error: 'Unauthorized' }); return false; }
