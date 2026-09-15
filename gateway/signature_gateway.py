@@ -11,12 +11,11 @@ import logging
 import os
 import re
 import ssl
-import urllib.error
 import urllib.request
 from email import policy
+from email.generator import BytesGenerator
 from email.message import EmailMessage
 from email.parser import BytesParser
-from email.generator import BytesGenerator
 from io import BytesIO
 
 import Milter
@@ -114,12 +113,13 @@ def append_plain_signature(text: str, signature: str) -> str:
     return text.rstrip() + "\n\n" + plain + "\n"
 
 
-def mutate_message(raw: bytes, resolved: dict) -> bytes:
-    msg = BytesParser(policy=policy.SMTP).parsebytes(raw)
+def mutate_message(raw_message: bytes, resolved: dict) -> bytes:
+    """Return a complete mutated MIME message for internal processing."""
+    msg = BytesParser(policy=policy.SMTP).parsebytes(raw_message)
     html_sig = resolved.get("html") or ""
     plain_sig = resolved.get("plainText") or ""
     if not html_sig:
-        return raw
+        return raw_message
 
     if msg.is_multipart():
         html_part = None
@@ -131,6 +131,7 @@ def mutate_message(raw: bytes, resolved: dict) -> bytes:
                 html_part = part
             elif part.get_content_type() == "text/plain" and text_part is None:
                 text_part = part
+
         if html_part is not None:
             current = html_part.get_payload(decode=True) or b""
             charset = html_part.get_content_charset() or "utf-8"
@@ -140,6 +141,7 @@ def mutate_message(raw: bytes, resolved: dict) -> bytes:
                 current_text = current.decode("utf-8", errors="replace")
             html_part.set_payload(append_html_signature(current_text.encode("utf-8"), html_sig).decode("utf-8"))
             html_part.set_charset("utf-8")
+
         if text_part is not None:
             current = text_part.get_payload(decode=True) or b""
             charset = text_part.get_content_charset() or "utf-8"
@@ -149,6 +151,7 @@ def mutate_message(raw: bytes, resolved: dict) -> bytes:
                 current_text = current.decode("utf-8", errors="replace")
             text_part.set_payload(append_plain_signature(current_text, plain_sig or html_sig))
             text_part.set_charset("utf-8")
+
     elif msg.get_content_type() == "text/html":
         current = msg.get_payload(decode=True) or b""
         charset = msg.get_content_charset() or "utf-8"
@@ -167,29 +170,76 @@ def mutate_message(raw: bytes, resolved: dict) -> bytes:
     return output.getvalue()
 
 
+def build_message_from_milter_headers(headers: list[tuple[str, str]], body: bytes) -> bytes:
+    """Reconstruct enough of the MIME message for Python's parser.
+
+    Milter's body callback contains the message body, not the SMTP headers.
+    Only headers needed for MIME parsing and message classification are retained.
+    """
+    wanted = {
+        "content-type",
+        "content-transfer-encoding",
+        "mime-version",
+        "in-reply-to",
+        "references",
+        "subject",
+    }
+    lines = []
+    for name, value in headers:
+        if name.lower() in wanted:
+            lines.append(f"{name}: {value}\r\n".encode("utf-8", errors="replace"))
+    return b"".join(lines) + b"\r\n" + body
+
+
+def extract_body(serialized: bytes) -> bytes:
+    separator = b"\r\n\r\n"
+    index = serialized.find(separator)
+    if index >= 0:
+        return serialized[index + len(separator):]
+    separator = b"\n\n"
+    index = serialized.find(separator)
+    if index >= 0:
+        return serialized[index + len(separator):]
+    return serialized
+
+
 class SignatureMilter(Milter.Base):
     def __init__(self):
         self.chunks = []
+        self.headers = []
         self.mail_from = ""
 
     def envfrom(self, *args):
         self.mail_from = sender_address(args[0] if args else "")
         return Milter.CONTINUE
 
+    def header(self, name, value):
+        self.headers.append((name, value))
+        return Milter.CONTINUE
+
+    def eoh(self):
+        return Milter.CONTINUE
+
     def eom(self):
-        raw = b"".join(self.chunks)
-        if not self.mail_from or not raw:
+        body = b"".join(self.chunks)
+        if not self.mail_from or not body:
             return Milter.CONTINUE
         try:
+            raw = build_message_from_milter_headers(self.headers, body)
             original = BytesParser(policy=policy.SMTP).parsebytes(raw)
             html = extract_html(original)
             if START in html or END in html:
                 return Milter.CONTINUE
-            resolved = call_resolver(self.mail_from, message_type(original), html.decode("utf-8", errors="replace"))
+            resolved = call_resolver(
+                self.mail_from,
+                message_type(original),
+                html.decode("utf-8", errors="replace"),
+            )
             if not resolved or not resolved.get("inject"):
                 return Milter.CONTINUE
             updated = mutate_message(raw, resolved)
-            self.replacebody(updated)
+            # pymilter replacebody() replaces the message BODY only, not headers.
+            self.replacebody(extract_body(updated))
         except Exception:
             log.exception("signature processing failed; fail-open")
         return Milter.CONTINUE
@@ -200,6 +250,8 @@ class SignatureMilter(Milter.Base):
 
     def close(self):
         self.chunks = []
+        self.headers = []
+        self.mail_from = ""
         return Milter.CONTINUE
 
 
